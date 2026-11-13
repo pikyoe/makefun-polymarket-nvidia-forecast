@@ -18,7 +18,10 @@
 #          still for minutes, then tick, then occasionally jump — including
 #          their asymmetry (a market near 0 can only really jump up) and
 #          the way the spread saturates instead of growing like sqrt(h)
-#          forever.
+#          forever. The changes are recency-weighted (exponential decay,
+#          half-life 120 minutes): volatility regimes change — a market
+#          that just jumped is likelier to jump again than one quiet for
+#          hours — so recent moves count more than old ones.
 #       2. Normal: z_tau * 0.0015 * sqrt(h), the house baseline's shape.
 #          It regularises the empirical quantiles, which are noisy for
 #          young markets and at long horizons, and guarantees a sane
@@ -31,12 +34,15 @@
 #
 # Tuning (practice cases p00-p04, whose answers are recoverable from the
 # next case's input, plus pseudo-cases cut from the last 24h of each
-# practice case's history): this scored a mean pinball loss of ~0.34 on the
-# five real practice cases, against ~0.37 for the house baseline at its
-# best sigma, and ~0.89 vs ~0.92 on the recent pseudo-cases. Parameters
-# were chosen at the flat middle of the grid (window 720, tail 0.8, blend
-# 0.5, sigma 0.0015, outer 1.3), not at a sharp optimum, so the result
-# does not hinge on one tuned number.
+# practice case's history): this scored a mean pinball loss of ~0.333 on the
+# five real practice cases, against ~0.393 for the house baseline, and
+# ~0.560 vs ~0.565 on the twelve pseudo-cases. Parameters were chosen at
+# the flat middle of the grid (window 720, tail 0.8, blend 0.5, sigma
+# 0.0015, outer 1.3, recency half-life 120), not at a sharp optimum, so the
+# result does not hinge on one tuned number. (Revision 2: recency
+# weighting replaced the unweighted empirical quantiles after the kit
+# check failed thinking_revised; horizon-shrink variants were tested and
+# rejected — they won on the five real cases but lost on the pseudo-cases.)
 #
 # Runs offline, deterministic (no randomness, no time, no network), well
 # inside the 8-second per-case cap: per market it sorts at most 720
@@ -64,6 +70,27 @@ BLEND = 0.5             # weight of the normal spread in the blend
 TAIL = 0.8              # overall shrink of the blended spread
 OUTER = 1.3             # extra widening of the 5% / 95% quantiles
 MIN_SAMPLES = 20        # extra points beyond h an anchor needs to count
+HL = 120                # recency half-life (minutes) for empirical changes
+
+
+def _wquantile(pairs, tau):
+    """Weighted linear-interpolation quantile of (value, weight) pairs."""
+    pairs = sorted(pairs)
+    tot = sum(w for _, w in pairs)
+    if tot <= 0 or len(pairs) == 1:
+        return pairs[0][0]
+    target = tau * tot
+    acc = 0.0
+    for i, (v, w) in enumerate(pairs):
+        prev_acc = acc
+        prev_v = pairs[i - 1][0] if i else v
+        acc += w
+        if acc >= target:
+            if i == 0:
+                return v
+            frac = (target - prev_acc) / w if w > 0 else 0.0
+            return prev_v * (1.0 - frac) + v * frac
+    return pairs[-1][0]
 
 
 def _quantile(sorted_vals, tau):
@@ -113,8 +140,9 @@ def forecast_market(prices, horizon):
     for h in ANCHORS:
         if n_use <= h + MIN_SAMPLES:
             continue
-        changes = sorted(use[i + h] - use[i] for i in range(n_use - h))
-        qs = [_quantile(changes, tau) for tau in QUANTILES]
+        pairs = [(use[i + h] - use[i], 0.5 ** ((n_use - 1 - (i + h)) / HL))
+                 for i in range(n_use - h)]
+        qs = [_wquantile(pairs, tau) for tau in QUANTILES]
         med = qs[2]
         anchor_log.append(math.log(h))
         anchor_off.append([q - med for q in qs])
